@@ -1,0 +1,250 @@
+import boto3,json,time,decimal,s3fs
+import pandas as pd
+import requests,logging
+import pyarrow.parquet as pq
+from datetime import datetime,timedelta
+from airflow import DAG
+
+from airflow.operators.bash import BashOperator
+from airflow.operators.python_operator import PythonOperator
+
+region_name = 'us-east-1'
+bootstrap_path='s3://sathyendraa-nv-land/Dependensies/dependencies.sh'
+
+def security_group_id(group_name, region_name):
+
+    ec2 = boto3.client('ec2', region_name=region_name)
+    response = ec2.describe_security_groups(GroupNames=[group_name])
+    return response['SecurityGroups'][0]['GroupId']
+    
+def read_config(**kwargs):
+
+    app_config_path = "s3://sathyendraa-nv-land/ConfigFiles/App_Configuration.json"
+    path_list = app_config_path.replace(":","").split("/")
+    s3 = boto3.resource(path_list[0])
+    obj = s3.Object(path_list[2], "/".join(path_list[3:]))
+    content = obj.get()['Body'].read().decode('utf-8')
+    jsonVal = json.loads(content)
+    return jsonVal
+    
+def copy_data(**kwargs):
+
+    ti = kwargs['ti']
+    jsonData = ti.xcom_pull(task_ids='read_config')
+    source_path_list = (jsonData['Land2Raw-Actives']['source']['data-location']).replace(":/","").split("/")
+    dest_path_list = (jsonData['Land2Raw-Actives']['destination']['data-location']).replace(":/","").split("/")
+    viewership_source_path_list = (jsonData['Land2Raw-Viewership']['source']['data-location']).replace(":/","").split("/")
+    viewership_dest_path_list = (jsonData['Land2Raw-Viewership']['destination']['data-location']).replace(":/","").split("/")
+    s3_client = boto3.client(source_path_list[0],aws_access_key_id='AKIAYBIYAGKJ7ZL4AMHN',
+    aws_secret_access_key='QNFPW/atCt8CTVGnBdeLvaWIaCucIlCGYiGl1d0A')
+
+    s3_client.copy_object(
+        CopySource = {'Bucket': source_path_list[1], 'Key': "/".join(source_path_list[2:])},
+        Bucket = dest_path_list[1],
+        Key = "/".join(dest_path_list[2:])
+        )
+    s3_client.copy_object(
+        CopySource = {'Bucket': viewership_source_path_list[1], 'Key': "/".join(viewership_source_path_list[2:])},
+        Bucket = viewership_dest_path_list[1],
+        Key = "/".join(viewership_dest_path_list[2:])
+        )
+    
+    print("Data Copied Successfully")
+
+def pre_validation(**kwargs):
+    ti = kwargs['ti']
+    jsonData = ti.xcom_pull(task_ids='read_config')
+    act_land_source=jsonData["Land2Raw-Actives"]["source"]["data-location"]
+    view_land_source=jsonData["Land2Raw-Viewership"]["source"]["data-location"]
+    act_raw_dest=jsonData["Land2Raw-Actives"]["destination"]["data-location"]
+    view_raw_dest=jsonData["Land2Raw-Viewership"]["destination"]["data-location"]
+
+    s3 = s3fs.S3FileSystem(key="AKIAYBIYAGKJ7ZL4AMHN",secret="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")
+
+    df_act_landingzone = pq.ParquetDataset(act_land_source, filesystem=s3).read_pandas().to_pandas()
+    df_act_rawzone = pq.ParquetDataset(act_raw_dest, filesystem=s3).read_pandas().to_pandas()
+
+    df_view_landingzone = pq.ParquetDataset(view_land_source, filesystem=s3).read_pandas().to_pandas()
+    df_view_rawzone = pq.ParquetDataset(view_raw_dest, filesystem=s3).read_pandas().to_pandas()
+    
+    #Data Availability Check for Active
+    if df_act_rawzone[df_act_rawzone.columns[0]].count() != 0:
+        #Record Count Check for Active
+        for raw_columnname in df_act_rawzone.columns:
+            if df_act_rawzone[raw_columnname].count() == df_act_landingzone[raw_columnname].count():
+                print('Count is Satisfied', raw_columnname)
+            else:
+                raise ValueError("Count Mismatch", raw_columnname)
+    else:
+        raise ValueError("No Data Available!")
+
+    #Data Availability Check for Viewership
+    if df_view_rawzone[df_view_rawzone.columns[0]].count() != 0:
+        #Record Count Check for Viewership
+        for raw_columnname in df_view_rawzone.columns:
+            if df_view_rawzone[raw_columnname].count() == df_view_landingzone[raw_columnname].count():
+                print('Count is Satisfied', raw_columnname)
+            else:
+                raise ValueError("Count Mismatch", raw_columnname)
+    else:
+        raise ValueError("No Data Available!")
+
+
+def post_validation(**kwargs):
+    ti = kwargs['ti']
+    jsonData = ti.xcom_pull(task_ids='read_config')
+    act_raw_dest=jsonData["Land2Raw-Actives"]["destination"]["data-location"]
+    act_stag_dest=jsonData["Land2Raw-Actives"]["staging"]["data-location"]
+
+    act_trans_cols=jsonData["Land2Raw-Actives"]["transformation-cols"]
+
+    s3 = s3fs.S3FileSystem(key="AKIAYBIYAGKJ7ZL4AMHN",secret="QNFPW/atCt8CTVGnBdeLvaWIaCucIlCGYiGl1d0A")
+
+    df_act_rawzone = pq.ParquetDataset(act_raw_dest, filesystem=s3).read_pandas().to_pandas()
+    # sample = pq.ParquetDataset(act_stag_dest, filesystem=s3)
+    # table = sample.read()
+    # df_act_stagzone = table.to_pandas() 
+    df_act_stagzone = pq.read_table(act_stag_dest).to_pandas()
+
+    #Data Availability Check for Actives
+    if df_act_stagzone[df_act_stagzone.columns[0]].count() != 0:
+        #Record Count Check for Actives
+        for raw_columnname in df_act_stagzone.columns:
+            if df_act_stagzone[raw_columnname].count() == df_act_rawzone[raw_columnname].count():
+                print('Count is Satisfied', raw_columnname)
+            else:
+                raise ValueError("Count Mismatch", raw_columnname)
+
+        #Datatype Validation for Actives
+        for i in act_trans_cols:
+            
+            if act_trans_cols[i].split(',')[0] == "DecimalType":
+                if isinstance(df_act_stagzone[i][0],decimal.Decimal) & (str(abs(decimal.Decimal(df_act_stagzone[i][0]).as_tuple().exponent)) == act_trans_cols[i].split(',')[1]):
+                    print('Datatype matches for '+ i)
+                else:
+                    raise TypeError("Datatype Mismatch in "+i)
+            
+            if act_trans_cols[i].split(',')[0] == "ArrayType-StringType" or act_trans_cols[i].split(',')[0] == "StringType":
+                if pd.api.types.is_string_dtype(df_act_stagzone[i]):
+                    print('Datatype matches for '+ i)
+                else:
+                    raise TypeError("Datatype Mismatch in "+i)
+
+    else:
+        raise ValueError("No Data Available!")
+
+    print("Successfull Post Validation on Active Dataset")
+
+
+def cluster_creation(**kwargs):
+
+    emr = boto3.client('emr', region_name=region_name)
+    master_security_group_id = security_group_id('Sathyendraa-NV-SG', region_name=region_name)
+    slave_security_group_id = master_security_group_id
+    cluster_response = emr.run_job_flow(
+            Name= 'Sathyendraa_Cluster',
+            ReleaseLabel= 'emr-6.2.1',
+            Instances={
+            'InstanceGroups': [
+                {
+                        'Name': "Master nodes",
+                        'Market': 'ON_DEMAND',
+                        'InstanceRole': 'MASTER',
+                        'InstanceType': 'm5.xlarge', 
+                        'InstanceCount': 1
+                    },
+                    {
+                        'Name': "Slave nodes",
+                        'Market': 'ON_DEMAND',
+                        'InstanceRole': 'CORE',
+                        'InstanceType': 'm5.xlarge',
+                        'InstanceCount': 1
+                        
+                    }
+                    ],
+                'KeepJobFlowAliveWhenNoSteps': True,
+                'Ec2KeyName' : 'SathyendraaNV-KP',
+                'EmrManagedMasterSecurityGroup': master_security_group_id,
+                'EmrManagedSlaveSecurityGroup': slave_security_group_id
+                
+            },
+
+            JobFlowRole='EMR_EC2_DefaultRole',
+            ServiceRole='EMR_DefaultRole',
+            AutoTerminationPolicy = {"IdleTimeout": 3600},
+            VisibleToAllUsers=True,
+            BootstrapActions= [
+                {
+                    'Name': 'Install boto3',
+                    'ScriptBootstrapAction': {
+                            'Path': bootstrap_path,
+                            'Args': []
+                        }
+                }
+            ],
+            Applications=[
+                { 'Name': 'hadoop' },
+                { 'Name': 'spark' },
+                { 'Name': 'hive' },
+                { 'Name': 'livy' }
+                ]
+        )
+    return cluster_response['JobFlowId']
+    
+
+def waiting_for_cluster(cluster_id):
+
+    emr = boto3.client('emr', region_name=region_name)
+    emr.get_waiter('cluster_running').wait(ClusterId=cluster_id) 
+  
+def retrieve_cluster_dns(cluster_id):
+
+    emr = boto3.client('emr', region_name=region_name)
+    response = emr.describe_cluster(ClusterId=cluster_id)
+    return response['Cluster']['MasterPublicDnsName']
+    
+def livy_commands(master_dns,sparkjob_code_path):
+
+    host = 'http://' + master_dns + ':8998'
+    data = {"file": sparkjob_code_path, "className": "com.example.SparkApp"}
+    headers = {'Content-Type': 'application/json'}
+    r = requests.post(host + '/batches', data=json.dumps(data), headers=headers)
+    r.json()
+     
+
+def livy_submit(**kwargs):
+
+    sparkjob_code_path = "s3://sathyendraa-nv-land/Code/SparkJobEMRPy.py"
+    cluster_id = cluster_creation()
+    waiting_for_cluster(cluster_id)
+    cluster_dns = retrieve_cluster_dns(cluster_id)
+    livy_commands(cluster_dns,sparkjob_code_path)
+
+with DAG(
+	dag_id='dagm8b',
+	start_date=datetime(2022,6,1),
+    schedule_interval="@daily",
+	catchup=False
+	) as dag:
+
+	read_config=PythonOperator(
+		task_id='read_config',
+		python_callable=read_config)
+    
+	copy_data = PythonOperator(
+		task_id='copy_data',
+		python_callable=copy_data)
+    	
+	pre_validation = PythonOperator(
+		task_id='pre_validation',
+		python_callable=pre_validation)
+
+	livy_submit = PythonOperator(
+        task_id='livy_submit',
+        python_callable= livy_submit)	
+		
+	post_validation = PythonOperator(
+        task_id='post_validation',
+        python_callable=post_validation)
+
+read_config>>copy_data>>pre_validation>>livy_submit>>post_validation

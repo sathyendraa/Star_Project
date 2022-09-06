@@ -1,0 +1,50 @@
+{
+	"Land2Raw-Actives": {
+		"source": {
+			"data-location": "s3://sathyendraa-nv-land/Datasets/Active/ActiveData.parquet",
+			"file-format": "parquet"
+		},
+		"destination": {
+			"data-location": "s3://sathyendraa-nv-rawzone/Datasets/Active/ActiveData.parquet",
+			"file-format": "parquet"
+		},
+		"masking-cols": ["advertising_id", "user_id"],
+		"transformation-cols": {
+			"user_latitude":"DecimalType,7",
+			"user_longitude":"DecimalType,7",
+			"location_source":"ArrayType-StringType"
+        },
+		"staging": {
+			"data-location": "s3://sathyendraa-nv-stagingzone/TransformedDataset/Active/",
+			"file-format": "parquet"
+		},
+		"partition-cols": ["month","date"]
+	},
+	
+	"Land2Raw-Viewership": {
+		"source": { 
+			"data-location": "s3://sathyendraa-nv-land/Datasets/Viewership/ViewershipData.parquet",
+			"file-format": "parquet"
+		},
+		"destination": {
+			"data-location": "s3://sathyendraa-nv-rawzone/Datasets/Viewership/ViewershipData.parquet",
+			"file-format": "parquet"
+		},
+		"masking-cols": ["advertising_id"],
+		"transformation-cols": {
+			"user_lat":"DecimalType,7",
+			"user_long":"DecimalType,7",
+			"location_source":"ArrayType-StringType"
+        },
+		"staging": {
+			"data-location": "s3://sathyendraa-nv-stagingzone/TransformedDataset/Viewership/",
+			"file-format": "parquet"
+		},
+		"partition-cols": ["month","date"]
+	},
+
+	"lookup-dataset": {
+		"data-location": "s3://sathyendraa-nv-stagingzone/TransformedDataset/LookupDataset/",
+		"pii-cols": ["advertising_id", "user_id"]
+		}
+}

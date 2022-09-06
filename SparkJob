@@ -1,0 +1,199 @@
+#Neccessary libraries are imported
+import json
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col,concat_ws,sha2,hash,to_date
+from pyspark.sql.types import DecimalType,DateType,DoubleType,StringType
+from pyspark.sql import functions as f
+import boto3
+import pyspark.sql.utils
+from pyspark.sql.utils import AnalysisException
+
+#SparkSession and sparkContext are created
+spark = SparkSession.builder.getOrCreate()
+sc = spark.sparkContext
+
+spark.sparkContext.addPyFile("s3://sathyendraa-nv-land/Dependensies/delta-core_2.12-0.8.0.jar")
+from delta import *
+
+#Configuration Class to get and store all the data from App_Configuration
+class Configuration:
+    def __init__(self):
+        #initialising readConfig function to get data from App_Configuration
+        self.dictData=self.readConfig()
+
+        self.s3 = boto3.resource('s3')
+
+        #S3 Location of the Datasets stored in the Landing Zone
+        self.act_land_source=self.dictData["Land2Raw-Actives"]["source"]["data-location"]
+        self.view_land_source=self.dictData["Land2Raw-Viewership"]["source"]["data-location"]
+
+        #S3 Location of the Datasets to be ingested to the Raw Zone
+        self.act_raw_dest=self.dictData["Land2Raw-Actives"]["destination"]["data-location"]
+        self.view_raw_dest=self.dictData["Land2Raw-Viewership"]["destination"]["data-location"]
+
+        #Columns of each dataset that needs to be transformed are stored in these variables
+        self.act_trans_cols=self.dictData["Land2Raw-Actives"]["transformation-cols"]
+        self.view_trans_cols=self.dictData["Land2Raw-Viewership"]["transformation-cols"]
+
+        #Columns of each dataset that needs to be masked are stored in these variables
+        self.act_mask_cols=self.dictData["Land2Raw-Actives"]["masking-cols"]
+        self.view_mask_cols=self.dictData["Land2Raw-Viewership"]["masking-cols"]
+
+        #Columns of each dataset that needs to be partitioned are stored in these variables
+        self.act_partition_cols=self.dictData["Land2Raw-Actives"]["partition-cols"]
+        self.view_partition_cols=self.dictData["Land2Raw-Viewership"]["partition-cols"]
+
+        #S3 Location of the Datasets to be ingested to the Staging Zone
+        self.act_stag_dest=self.dictData["Land2Raw-Actives"]["staging"]["data-location"]
+        self.view_stag_dest=self.dictData["Land2Raw-Viewership"]["staging"]["data-location"]
+    
+        self.lookup_location=self.dictData['lookup-dataset']['data-location']
+        self.pii_cols=self.dictData['lookup-dataset']['pii-cols']
+
+    #Function to Read and get the data from the App_Configuration file 
+    def readConfig(self):
+        #.collect will put the file contents in a list
+        appconfig = sc.textFile("s3://sathyendraa-nv-land/ConfigFiles/App_Configuration.json").collect()
+
+        #.join will put the contents in whole string
+        strconfig = ''.join(appconfig)
+
+        #.loads will put the string in a dictionary format to get values form a key
+        Data = json.loads(strconfig)
+        return Data
+
+
+#Transformation class to process all the transformations of the dataset and store it in S3
+class Transformation:
+
+    #Function to read the dataframe from a specific location
+    def readData(self,path):
+        df=spark.read.parquet(path)
+        return df
+
+    #Function to write the dataframe to a specific location and file fomat
+    def writeData(self,df,path):
+        df.write.parquet(path)
+
+    #Function to typecast number of columns of the dataframe and return it
+    def typeCast(self,df,transCols):
+        lst=[]
+
+        for column in transCols.keys():
+            lst.append(column)
+
+        for i in lst:
+            if transCols[i].split(",")[0]=="DecimalType":
+                df=df.withColumn(i,df[i].cast(DecimalType(scale=int(transCols[i].split(",")[1]))))
+            else:
+                df=df.withColumn(i,concat_ws(",",col(i)))
+
+        #Datatype of the column named date(string) is casted to DateType() for partitioning
+        df=df.withColumn('date',df['date'].cast(DateType()))
+
+        return df  
+
+    #Function to typecast number of columns of the dataframe and return it               
+    def mask(self,df,maskCols):
+        for i in maskCols:
+            df = df.withColumn("masked_"+i,sha2(df[i],256))
+        return df   
+
+    #Function to implement SCD2 for Lookup Dataset and return it
+    def lookup_dataset(self,df,lookup_location,pii_cols,datasetName):
+        datasetName1 = 'lookup'
+        df_source = df.withColumn("begin_date",f.current_date())
+        df_source = df_source.withColumn("update_date",f.lit("null"))
+        
+        pii_cols = [i for i in pii_cols if i in df.columns]
+            
+        columns_needed = []
+        insert_dict = {}
+        for col in pii_cols:
+            if col in df.columns:
+                columns_needed += [col,"masked_"+col]
+        source_columns_used = columns_needed + ['begin_date','update_date']
+        print(source_columns_used)
+
+        df_source = df_source.select(*source_columns_used)
+
+        try:
+            targetTable = DeltaTable.forPath(spark,lookup_location+datasetName)
+            delta_df = targetTable.toDF()
+        except pyspark.sql.utils.AnalysisException:
+            print('Table does not exist')
+            df_source = df_source.withColumn("flag_active",f.lit("true"))
+            df_source.write.format("delta").mode("overwrite").save(lookup_location)
+            print('Table Created Sucessfully!')
+            targetTable = DeltaTable.forPath(spark,lookup_location)
+            delta_df = targetTable.toDF()
+            delta_df.show(100)
+
+        for i in columns_needed:
+            insert_dict[i] = "updates."+i
+            
+        insert_dict['begin_date'] = f.current_date()
+        insert_dict['flag_active'] = "True" 
+        insert_dict['update_date'] = "null"
+        
+        print(insert_dict)
+        
+        _condition = datasetName1+".flag_active == true AND "+" OR ".join(["updates."+i+" <> "+ datasetName1+"."+i for i in [x for x in columns_needed if x.startswith("masked_")]])
+        
+        print(_condition)
+        
+        column = ",".join([datasetName1+"."+i for i in [x for x in pii_cols]]) 
+        
+        print(column)
+
+        updatedColumnsToInsert = df_source.alias("updates").join(targetTable.toDF().alias(datasetName1), pii_cols).where(_condition) 
+        
+        print(updatedColumnsToInsert)
+
+        stagedUpdates = (
+          updatedColumnsToInsert.selectExpr('NULL as mergeKey',*[f"updates.{i}" for i in df_source.columns]).union(df_source.selectExpr("concat("+','.join([x for x in pii_cols])+") as mergeKey", "*")))
+
+        targetTable.alias(datasetName1).merge(stagedUpdates.alias("updates"),"concat("+str(column)+") = mergeKey").whenMatchedUpdate(
+            condition = _condition,
+            set = {                  # Set current to false and endDate to source's effective date."flag_active" : "False",
+            "update_date" : f.current_date()
+          }
+        ).whenNotMatchedInsert(
+          values = insert_dict
+        ).execute()
+
+        for i in pii_cols:
+            df = df.drop(i).withColumnRenamed("masked_"+i, i)
+
+        return df
+
+    #Function to partition number of columns of the dataframe and write it to a specific location it    
+    def partitionWrite(self,df,parCols,path):
+        df.write.partitionBy(parCols).mode("overwrite").save(path)
+        return df
+
+datasetName = "Actives.parquet"
+
+#Objects of the 2 classes are created for accessing them in main function
+confObj=Configuration()
+transObj=Transformation()
+
+#Data is read from the Raw Zone 
+actsparkDF=transObj.readData(confObj.act_raw_dest)
+viewsparkDF=transObj.readData(confObj.view_raw_dest)
+
+#Typecasting is performed on the dataset 
+actsparkDF=transObj.typeCast(actsparkDF,confObj.act_trans_cols)
+viewsparkDF=transObj.typeCast(viewsparkDF,confObj.view_trans_cols)
+
+#Masking is performed on the dataset 
+actsparkDF=transObj.mask(actsparkDF,confObj.act_mask_cols)
+viewsparkDF=transObj.mask(viewsparkDF,confObj.view_mask_cols)
+
+actsparkDF = transObj.lookup_dataset(actsparkDF,confObj.lookup_location,confObj.pii_cols,datasetName)
+
+#The transformed data is ingested to the Staging Zone after Partitioning   
+actsparkDF=transObj.partitionWrite(actsparkDF,confObj.act_partition_cols,confObj.act_stag_dest)
+viewsparkDF=transObj.partitionWrite(viewsparkDF,confObj.view_partition_cols,confObj.view_stag_dest)
+
+spark.stop()

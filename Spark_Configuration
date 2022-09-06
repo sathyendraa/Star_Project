@@ -1,0 +1,28 @@
+[
+    {
+      "Classification": "spark-defaults",
+      "Properties": {
+
+	      "spark.path":"s3://sathyendraa-nv-land/Milestone7/ConfigFiles/App_Configuration.json",
+        
+        "spark.master":"yarn",  
+
+        "spark.submit.deployMode":"cluster",
+
+        "spark.driver.memory":"4g", 
+        "spark.executor.memory":"1g",
+
+        "spark.driver.cores":1, 
+        "spark.executor.cores":2, 
+        
+        "spark.dynamicAllocation.minExecutors":10,       
+
+        "spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version":2, 
+
+        "spark.hadoop.fs.s3a.block.size":"512M", 
+        
+        "maximizeResourceAllocation": "true" 
+      }
+    }
+    
+]
